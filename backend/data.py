@@ -40,5 +40,5 @@ def get_seller(seller_id: str):
 
 
 def trend_for(seller: dict):
-    values = [round(seller["revenue"] / 14 * (0.72 + i * 0.024 + (i % 3) * 0.015)) for i in range(14)]
+    values = [round(seller["revenue"] / 14 * (0.98 - i * 0.02 + (i % 3) * 0.012)) for i in range(14)]
     return [{"day": (date.today() - timedelta(days=13 - i)).strftime("%b %d"), "revenue": value} for i, value in enumerate(values)]
