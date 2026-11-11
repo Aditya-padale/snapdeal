@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+pandas
+sqlalchemy
+python-multipart
+httpx
+openai
+faster-whisper
+# faster-whisper 1.2.x still passes metadata_errors to PyAV.
+av<19
+piper-tts
