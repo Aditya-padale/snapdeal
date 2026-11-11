@@ -1,5 +1,8 @@
 from .data import trend_for
 
+PRICE_ELASTICITY = 1.5
+MAX_ELASTICITY = 0.4
+
 
 def sales_trend_for(seller: dict, product: dict):
     trend = trend_for(seller)
@@ -8,7 +11,10 @@ def sales_trend_for(seller: dict, product: dict):
 
 def funnel_for(seller: dict, product: dict):
     product_share = product["views"] / seller["views"] if seller["views"] else 0
-    return {"product_id": product["id"], "impressions": round(seller["impressions"] * product_share), "views": product["views"], "ctr_percent": round(product["views"] / (seller["impressions"] * product_share) * 100, 2) if product_share else seller["ctr"], "conversion_percent": product["conversion"], "previous_conversion_percent": product["previous_conversion"], "returns_percent": seller["returns"], "impressions_stable": True}
+    impressions = round(seller["impressions"] * product_share)
+    previous_impressions = round(seller["previous_impressions"] * product_share)
+    change_percent = round((impressions - previous_impressions) / previous_impressions * 100, 1) if previous_impressions else 0
+    return {"product_id": product["id"], "impressions": impressions, "previous_impressions": previous_impressions, "impressions_change_percent": change_percent, "views": product["views"], "ctr_percent": round(product["views"] / impressions * 100, 2) if impressions else seller["ctr"], "conversion_percent": product["conversion"], "previous_conversion_percent": product["previous_conversion"], "returns_percent": seller["returns"]}
 
 
 def price_comparison_for(seller: dict, product: dict):
@@ -22,12 +28,12 @@ def inventory_for(seller: dict, product: dict):
 
 def simulate_price_change(product: dict, new_price: float, days: int):
     price_change = (new_price - product["price"]) / product["price"]
-    elasticity = max(-0.4, min(0.4, -price_change * 1.5))
+    elasticity = max(-MAX_ELASTICITY, min(MAX_ELASTICITY, -price_change * PRICE_ELASTICITY))
     projected_orders = round(product["orders"] * (1 + elasticity) * days / 14)
     projected_revenue = round(projected_orders * new_price)
     projected_conversion = round(product["conversion"] * (1 + elasticity), 2)
     projected_margin = round(product["margin"] + (product["price"] - new_price) / new_price * 100, 1)
-    return {"product_id": product["id"], "product": product["name"], "days": days, "current_price": product["price"], "new_price": new_price, "projected_orders": projected_orders, "projected_revenue": projected_revenue, "projected_conversion": projected_conversion, "projected_margin": projected_margin, "assumption": "Directional estimate: conversion changes by 1.5x the price change, capped at plus or minus 40%; baseline demand and margin are held constant."}
+    return {"product_id": product["id"], "product": product["name"], "days": days, "current_price": product["price"], "new_price": new_price, "price_change_percent": round(price_change * 100, 1), "elasticity_factor": round(elasticity, 3), "projected_orders": projected_orders, "projected_revenue": projected_revenue, "projected_conversion": projected_conversion, "projected_margin": projected_margin, "assumption": f"Directional estimate: conversion and orders respond by {PRICE_ELASTICITY}x the price change, capped at plus or minus {MAX_ELASTICITY * 100:.0f}%; restock removes the stock constraint."}
 
 
 def analytics_for(seller: dict):
@@ -41,7 +47,8 @@ def analytics_for(seller: dict):
     current_price = sum(p["price"] for p in products) / len(products)
     previous_price = sum(p.get("previous_price", p["price"]) for p in products) / len(products)
     aov_change = round((current_price - previous_price) / previous_price * 100, 1) if previous_price else 0
+    impressions_change = round((seller["impressions"] - seller["previous_impressions"]) / seller["previous_impressions"] * 100, 1)
     return {"seller": seller, "trend": trend, "sales_change": sales_change, "avg_competitor_gap": avg_competitor_gap,
             "changes": {"revenue": sales_change, "orders": sales_change, "conversion": conversion_change, "aov": aov_change},
-            "observations": {"impressions_stable": True, "conversion_decline": round(seller["products"][0]["previous_conversion"] - seller["products"][0]["conversion"], 2), "top_product": products[0]["name"]}}
+            "observations": {"impressions_change_percent": impressions_change, "conversion_decline": round(seller["products"][0]["previous_conversion"] - seller["products"][0]["conversion"], 2), "top_product": products[0]["name"]}}
 

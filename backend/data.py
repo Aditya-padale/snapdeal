@@ -3,7 +3,7 @@ from datetime import date, timedelta
 SELLERS = [
     {
         "id": "SEL-10482", "name": "Aarav Threads", "category": "Fashion & Apparel", "location": "Jaipur, Rajasthan",
-        "revenue": 184260, "orders": 196, "impressions": 148200, "views": 11840, "ctr": 7.99,
+        "revenue": 184260, "orders": 196, "impressions": 148200, "previous_impressions": 149900, "views": 11840, "ctr": 7.99,
         "conversion": 1.66, "aov": 940.10, "cancellation": 2.4, "returns": 8.1,
         "rating": 4.2, "inventory_value": 286, "synthetic": True,
         "products": [
@@ -14,7 +14,7 @@ SELLERS = [
     },
     {
         "id": "SEL-22017", "name": "Mitti Home", "category": "Home & Living", "location": "Pune, Maharashtra",
-        "revenue": 132480, "orders": 143, "impressions": 102500, "views": 8040, "ctr": 7.84,
+        "revenue": 132480, "orders": 143, "impressions": 102500, "previous_impressions": 104200, "views": 8040, "ctr": 7.84,
         "conversion": 1.78, "aov": 926.43, "cancellation": 1.7, "returns": 5.2,
         "rating": 4.5, "inventory_value": 412, "synthetic": True,
         "products": [
@@ -24,7 +24,7 @@ SELLERS = [
     },
     {
         "id": "SEL-30991", "name": "Nimble Kitchen", "category": "Kitchen & Dining", "location": "Bengaluru, Karnataka",
-        "revenue": 96420, "orders": 124, "impressions": 88200, "views": 7160, "ctr": 8.12,
+        "revenue": 96420, "orders": 124, "impressions": 88200, "previous_impressions": 91400, "views": 7160, "ctr": 8.12,
         "conversion": 1.73, "aov": 777.58, "cancellation": 3.2, "returns": 6.4,
         "rating": 4.0, "inventory_value": 168, "synthetic": True,
         "products": [

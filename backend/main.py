@@ -1,6 +1,9 @@
 import os
 import json
 import uuid
+import logging
+import re
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +21,8 @@ try:
 except ImportError:
     OpenAI = None
 
+logger = logging.getLogger(__name__)
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     database_path = Path("/tmp/virtual_kam.db") if os.getenv("VERCEL") else Path(__file__).parent / "virtual_kam.db"
@@ -27,9 +32,9 @@ engine = create_engine(DATABASE_URL, **engine_options)
 with engine.begin() as conn:
     conn.execute(text("CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, seller_id TEXT, role TEXT, content TEXT, created_at TEXT)"))
     conn.execute(text("CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, seller_id TEXT, product_id TEXT, action TEXT, status TEXT, created_at TEXT)"))
-    conn.execute(text("CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, seller_id TEXT, type TEXT, params TEXT, status TEXT, created_at TEXT, executed_at TEXT, estimated_impact TEXT, measured_impact TEXT)"))
+    conn.execute(text("CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, seller_id TEXT, type TEXT, params TEXT, status TEXT, created_at TEXT, executed_at TEXT, estimated_impact TEXT, measured_impact TEXT, applied_at TEXT)"))
     action_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(actions)"))}
-    for column in ("type", "params", "executed_at", "estimated_impact", "measured_impact"):
+    for column in ("type", "params", "executed_at", "estimated_impact", "measured_impact", "applied_at"):
         if column not in action_columns:
             conn.execute(text(f"ALTER TABLE actions ADD COLUMN {column} TEXT"))
 
@@ -45,6 +50,7 @@ class ChatRequest(BaseModel):
     seller_id: str
     message: str = Field(min_length=1, max_length=4000)
     history: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+    language: str = Field(default="en-IN", pattern=r"^(en-IN|hi-IN)$")
 
 class SimulationRequest(BaseModel):
     product_id: str
@@ -82,8 +88,14 @@ def seller_radar(seller_id: str):
     metrics = analytics_for(seller)
     product = seller["products"][0]
     decline = abs(metrics["sales_change"])
+    with engine.begin() as conn:
+        last = conn.execute(text("SELECT measured_impact FROM actions WHERE seller_id = :seller_id AND status = 'executed' AND measured_impact IS NOT NULL ORDER BY executed_at DESC LIMIT 1"), {"seller_id": seller_id}).scalar()
+    callback = ""
+    if last:
+        outcome = json.loads(last)
+        callback = f" Last time, the simulated 3-day outcome changed orders by {outcome['measured_impact']['orders_change_percent']}%."
     return {"seller_id": seller_id, "top_issue": product["name"], "decline_percent": decline,
-        "opening_line": f"I noticed {product['name']}'s sales dropped {decline:.1f}% this week. I have checked the signals and want to walk you through the next action."}
+        "opening_line": f"I noticed {product['name']}'s sales dropped {decline:.1f}% this week.{callback} I have checked the signals and want to walk you through the next action."}
 
 @app.get("/api/sellers/{seller_id}/products")
 def products(seller_id: str):
@@ -174,81 +186,131 @@ def _tool_definitions():
     ]
 
 
-def _tool_result(name: str, arguments: dict, seller: dict, seller_id: str):
+APPROVAL_PHRASES = ("yes", "yeah", "approve", "approved", "go ahead", "do it", "haan", "ha", "kar do", "theek hai")
+NEGATION_WORDS = ("no", "not", "don't", "nahi", "mat")
+
+
+def is_explicit_approval(message: str) -> bool:
+    normalized = message.lower()
+    if any(re.search(rf"\b{re.escape(word)}\b", normalized) for word in NEGATION_WORDS):
+        return False
+    return any(re.search(rf"\b{re.escape(phrase)}\b", normalized) for phrase in APPROVAL_PHRASES)
+
+
+def _trace_item(tool: str, arguments: dict, result: dict):
+    product = result.get("product", "the product")
+    if tool == "get_funnel":
+        hypothesis = "Traffic is the cause"
+        verdict = "flagged" if abs(result.get("impressions_change_percent", 0)) > 5 else "ruled out"
+        summary = f"{result.get('impressions')} impressions versus {result.get('previous_impressions')} previously; conversion {result.get('previous_conversion_percent')}% to {result.get('conversion_percent')}%"
+    elif tool == "get_competitor_prices":
+        hypothesis = "Price is the cause"
+        verdict = "flagged" if result.get("gap_percent", 0) > 0 else "ruled out"
+        summary = f"Seller {result.get('seller_price')} versus competitor {result.get('competitor_price')} ({result.get('gap_percent')}% gap)"
+    elif tool == "get_inventory":
+        hypothesis = "Inventory, ratings, or returns are the cause"
+        verdict = "flagged" if result.get("days_of_cover") is not None and result["days_of_cover"] < 7 or result.get("rating", 5) < 4 or result.get("returns_percent", 0) >= 10 else "ruled out"
+        summary = f"{result.get('inventory')} units; {result.get('days_of_cover')} days of cover; rating {result.get('rating')}; returns {result.get('returns_percent')}%"
+    elif tool == "get_sales_trend":
+        hypothesis = "The sales trend confirms a meaningful drop"
+        verdict = "flagged" if result.get("sales_change_percent", 0) < 0 else "ruled out"
+        summary = f"14-day revenue trend changed {result.get('sales_change_percent')}%"
+    elif tool == "simulate_price_change":
+        hypothesis = "The proposed price can recover conversion"
+        verdict = "flagged" if result.get("projected_orders", 0) >= 0 else "ruled out"
+        summary = f"{product}: {result.get('projected_orders')} projected orders in {result.get('days')} days at {result.get('new_price')}"
+    else:
+        hypothesis = "The proposed action is ready for seller approval"
+        verdict = "flagged" if not result.get("error") else "ruled out"
+        summary = "Action proposed" if not result.get("error") else result["error"]
+    return {"tool": tool, "args": arguments, "result_summary": summary, "hypothesis": hypothesis, "verdict": verdict}
+
+
+def _record_trace(trace: list, tool: str, arguments: dict, result: dict):
+    trace.append(_trace_item(tool, arguments, result))
+    if tool == "get_funnel":
+        conversion_drop = result.get("previous_conversion_percent", 0) - result.get("conversion_percent", 0)
+        trace.append({"tool": tool, "args": arguments, "result_summary": f"Conversion declined {round(conversion_drop, 2)} points", "hypothesis": "Conversion is the cause", "verdict": "flagged" if conversion_drop > 0 else "ruled out"})
+    elif tool == "get_inventory":
+        quality_issue = result.get("rating", 5) < 4 or result.get("returns_percent", 0) >= 10
+        trace.append({"tool": tool, "args": arguments, "result_summary": f"Rating {result.get('rating')}; returns {result.get('returns_percent')}%", "hypothesis": "Ratings or returns are the cause", "verdict": "flagged" if quality_issue else "ruled out"})
+
+
+def _confirm_action(seller_id: str, action_id: str):
+    with engine.begin() as conn:
+        latest = conn.execute(text("SELECT id FROM actions WHERE seller_id = :seller_id AND status = 'proposed' ORDER BY created_at DESC LIMIT 1"), {"seller_id": seller_id}).scalar()
+        if latest != action_id:
+            return {"error": "Only the most recent pending action can be approved"}
+        row = conn.execute(text("SELECT * FROM actions WHERE id = :id AND seller_id = :seller_id AND status = 'proposed'"), {"id": action_id, "seller_id": seller_id}).mappings().first()
+        if not row:
+            return {"error": "No pending action found"}
+        action = dict(row)
+        executed_at = datetime.utcnow().isoformat()
+        conn.execute(text("UPDATE actions SET status = 'executed', executed_at = :executed_at WHERE id = :id"), {"id": action_id, "executed_at": executed_at})
+        params = json.loads(action["params"])
+        approval = {"id": str(uuid.uuid4()), "seller_id": seller_id, "product_id": params["product_id"], "action": action["type"], "status": "approved", "created_at": executed_at}
+        conn.execute(text("INSERT INTO approvals VALUES (:id,:seller_id,:product_id,:action,:status,:created_at)"), approval)
+    return {**_action_row(action), "status": "executed", "executed_at": executed_at, "approval": "seller-approved", "execution": "mock"}
+
+
+def _tool_result(name: str, arguments: dict, seller: dict, seller_id: str, trace: list | None = None):
     product = next((item for item in seller["products"] if item["id"] == arguments.get("product_id")), seller["products"][0])
-    if name == "get_sales_trend": return sales_trend_for(seller, product)
-    if name == "get_funnel": return funnel_for(seller, product)
-    if name == "get_competitor_prices": return price_comparison_for(seller, product)
-    if name == "get_inventory": return inventory_for(seller, product)
-    if name == "simulate_price_change": return simulate_price_change(product, float(arguments["new_price"]), int(arguments.get("days", 7)))
-    if name == "propose_action":
-        action = {"id": str(uuid.uuid4()), "seller_id": seller_id, "type": arguments["type"], "params": json.dumps({"product_id": arguments["product_id"], **arguments["params"]}), "status": "proposed", "created_at": datetime.utcnow().isoformat(), "executed_at": None, "estimated_impact": json.dumps(arguments["estimated_impact"]), "measured_impact": None}
+    if name == "get_sales_trend": result = sales_trend_for(seller, product)
+    elif name == "get_funnel": result = funnel_for(seller, product)
+    elif name == "get_competitor_prices": result = price_comparison_for(seller, product)
+    elif name == "get_inventory": result = inventory_for(seller, product)
+    elif name == "simulate_price_change": result = simulate_price_change(product, float(arguments["new_price"]), int(arguments.get("days", 7)))
+    elif name == "propose_action":
+        params = {"product_id": arguments["product_id"], **arguments["params"]}
         with engine.begin() as conn:
-            conn.execute(text("INSERT INTO actions (id,seller_id,type,params,status,created_at,executed_at,estimated_impact,measured_impact) VALUES (:id,:seller_id,:type,:params,:status,:created_at,:executed_at,:estimated_impact,:measured_impact)"), action)
-        return _action_row(action)
-    if name == "confirm_action":
-        with engine.begin() as conn:
-            row = conn.execute(text("SELECT * FROM actions WHERE id = :id AND seller_id = :seller_id AND status = 'proposed'"), {"id": arguments["action_id"], "seller_id": seller_id}).mappings().first()
-            if not row: return {"error": "No pending action found"}
-            action = dict(row)
-            conn.execute(text("UPDATE actions SET status = 'executed', executed_at = :executed_at WHERE id = :id"), {"id": action["id"], "executed_at": datetime.utcnow().isoformat()})
-        return {**_action_row(action), "status": "executed", "approval": "seller-approved", "execution": "mock"}
-    if name == "record_approval":
-        approval = {"id": str(uuid.uuid4()), "seller_id": seller_id, "product_id": arguments["product_id"], "action": arguments["action"], "status": "approved", "created_at": datetime.utcnow().isoformat()}
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO approvals VALUES (:id,:seller_id,:product_id,:action,:status,:created_at)"), approval)
-        return approval
-    raise ValueError(f"Unknown tool: {name}")
+            existing = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id AND status = 'proposed' AND json_extract(params, '$.product_id') = :product_id ORDER BY created_at DESC LIMIT 1"), {"seller_id": seller_id, "product_id": arguments["product_id"]}).mappings().first()
+            if existing:
+                result = _action_row(existing)
+            else:
+                action = {"id": str(uuid.uuid4()), "seller_id": seller_id, "type": arguments["type"], "params": json.dumps(params), "status": "proposed", "created_at": datetime.utcnow().isoformat(), "executed_at": None, "estimated_impact": json.dumps(arguments["estimated_impact"]), "measured_impact": None, "applied_at": None}
+                conn.execute(text("INSERT INTO actions (id,seller_id,type,params,status,created_at,executed_at,estimated_impact,measured_impact,applied_at) VALUES (:id,:seller_id,:type,:params,:status,:created_at,:executed_at,:estimated_impact,:measured_impact,:applied_at)"), action)
+                result = _action_row(action)
+    elif name == "confirm_action":
+        result = _confirm_action(seller_id, arguments["action_id"])
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+    if trace is not None:
+        _record_trace(trace, name, arguments, result)
+    return result
 
-def _trace_for(seller):
-    product = seller["products"][0]
-    funnel = _tool_result("get_funnel", {"product_id": product["id"]}, seller, seller["id"])
-    pricing = _tool_result("get_competitor_prices", {"product_id": product["id"]}, seller, seller["id"])
-    inventory = _tool_result("get_inventory", {"product_id": product["id"]}, seller, seller["id"])
-    return [
-        {"tool": "get_funnel", "args": {"product_id": product["id"]}, "result_summary": f"{funnel['impressions']} impressions; conversion {funnel['previous_conversion_percent']}% to {funnel['conversion_percent']}%", "hypothesis": "Traffic is the cause", "verdict": "ruled out" if funnel["impressions_stable"] else "flagged"},
-        {"tool": "get_funnel", "args": {"product_id": product["id"]}, "result_summary": f"Conversion declined {round(funnel['previous_conversion_percent'] - funnel['conversion_percent'], 2)} points", "hypothesis": "Conversion is the cause", "verdict": "flagged"},
-        {"tool": "get_competitor_prices", "args": {"product_id": product["id"]}, "result_summary": f"Seller {pricing['seller_price']} vs competitor {pricing['competitor_price']} ({pricing['gap_percent']}% gap)", "hypothesis": "Price is the cause", "verdict": "flagged" if pricing["gap_percent"] > 0 else "ruled out"},
-        {"tool": "get_inventory", "args": {"product_id": product["id"]}, "result_summary": f"{inventory['inventory']} units; {inventory['days_of_cover']} days of cover", "hypothesis": "Inventory is the cause", "verdict": "flagged" if inventory["days_of_cover"] < 7 else "ruled out"},
-        {"tool": "get_inventory", "args": {"product_id": product["id"]}, "result_summary": f"Rating {inventory['rating']}; returns {inventory['returns_percent']}%", "hypothesis": "Ratings or returns are the cause", "verdict": "ruled out" if inventory["rating"] >= 4.0 and inventory["returns_percent"] < 10 else "flagged"},
-    ]
-
-
-def _grounded_fallback(request: ChatRequest, seller: dict):
+def _grounded_fallback(request: ChatRequest, seller: dict, trace: list):
     product = seller["products"][0]
     message = request.message.lower()
     if not request.history and not any(word in message for word in (product["name"].lower(), seller["category"].lower())):
         return "Which product or category dropped? I will check traffic, conversion, price, stock, ratings, and returns in that order."
-    funnel = funnel_for(seller, product)
-    pricing = price_comparison_for(seller, product)
-    inventory = inventory_for(seller, product)
-    return (f"For {product['name']}, impressions are {funnel['impressions']} and conversion fell from "
-            f"{product['previous_conversion']}% to {product['conversion']}%. The price is {pricing['gap_percent']}% "
-            f"above the competitor and only {inventory['inventory']} units remain. Traffic looks stable, so I rank "
-            f"conversion and price ahead of stock. Should I propose {product['name']} at ₹899 for 7 days and restocking 40 units?")
+    with engine.begin() as conn:
+        latest = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id ORDER BY created_at DESC LIMIT 1"), {"seller_id": seller["id"]}).mappings().first()
+    if latest and latest["status"] == "executed" and latest["measured_impact"]:
+        outcome = json.loads(latest["measured_impact"])
+        return f"The approved mock action is executed. Its simulated 3-day outcome changed orders by {outcome['measured_impact']['orders_change_percent']}% and conversion moved from {outcome['measured_impact']['conversion_before']}% to {outcome['measured_impact']['conversion_after']}%."
+    if latest and latest["status"] == "proposed":
+        params = json.loads(latest["params"])
+        return f"The proposal is still pending approval: {params['new_price']} rupees for {params['days']} days and {params['restock_units']} restock units. Do you approve?"
+    funnel = _tool_result("get_funnel", {"product_id": product["id"]}, seller, seller["id"], trace)
+    pricing = _tool_result("get_competitor_prices", {"product_id": product["id"]}, seller, seller["id"], trace)
+    inventory = _tool_result("get_inventory", {"product_id": product["id"]}, seller, seller["id"], trace)
+    price = pricing["competitor_price"]
+    days = 7
+    restock = max(0, round(product["velocity"] * 21 - product["inventory"]))
+    estimate = _tool_result("simulate_price_change", {"product_id": product["id"], "new_price": price, "days": days}, seller, seller["id"], trace)
+    _tool_result("propose_action", {"product_id": product["id"], "type": "price_and_restock", "params": {"new_price": price, "days": days, "restock_units": restock}, "estimated_impact": estimate}, seller, seller["id"], trace)
+    return (f"For {product['name']}, impressions changed {funnel['impressions_change_percent']}% and conversion fell from "
+            f"{funnel['previous_conversion_percent']}% to {funnel['conversion_percent']}%. The price is {pricing['gap_percent']}% "
+            f"above the competitor and there are {inventory['days_of_cover']} days of cover. I propose {price} rupees for {days} days "
+            f"and restocking {restock} units. The directional estimate is {estimate['projected_orders']} orders and {estimate['projected_conversion']}% conversion. Do you approve?")
 
 
 def _fallback_approval(request: ChatRequest, seller: dict):
-    explicit_yes = any(phrase in request.message.lower() for phrase in ("yes", "approve", "approved", "go ahead", "do it"))
-    if not explicit_yes:
+    if not is_explicit_approval(request.message):
         return None
     with engine.begin() as conn:
-        row = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id AND status = 'proposed' ORDER BY created_at DESC LIMIT 1"), {"seller_id": request.seller_id}).mappings().first()
-        if not row: return None
-        action = dict(row)
-        executed_at = datetime.utcnow().isoformat()
-        conn.execute(text("UPDATE actions SET status = 'executed', executed_at = :executed_at WHERE id = :id"), {"id": action["id"], "executed_at": executed_at})
-    return {**_action_row(action), "status": "executed", "executed_at": executed_at, "approval": "seller-approved", "execution": "mock"}
-
-def _ensure_proposed(seller):
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id AND status = 'proposed' ORDER BY created_at DESC LIMIT 1"), {"seller_id": seller["id"]}).mappings().first()
-        if row: return _action_row(row)
-        product = seller["products"][0]
-        action = {"id": str(uuid.uuid4()), "seller_id": seller["id"], "type": "price_and_restock", "params": json.dumps({"product_id": product["id"], "new_price": 899, "days": 7, "restock_units": 40}), "status": "proposed", "created_at": datetime.utcnow().isoformat(), "executed_at": None, "estimated_impact": json.dumps({"conversion": "1.7% to 2.6% directional estimate", "orders": "+18% directional estimate"}), "measured_impact": None}
-        conn.execute(text("INSERT INTO actions (id,seller_id,type,params,status,created_at,executed_at,estimated_impact,measured_impact) VALUES (:id,:seller_id,:type,:params,:status,:created_at,:executed_at,:estimated_impact,:measured_impact)"), action)
-    return _action_row(action)
-
+        action_id = conn.execute(text("SELECT id FROM actions WHERE seller_id = :seller_id AND status = 'proposed' ORDER BY created_at DESC LIMIT 1"), {"seller_id": request.seller_id}).scalar()
+    return _confirm_action(request.seller_id, action_id) if action_id else None
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
@@ -257,17 +319,27 @@ def chat(request: ChatRequest):
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO conversations VALUES (:id,:seller_id,'user',:content,:created_at)"), {"id": str(uuid.uuid4()), "seller_id": request.seller_id, "content": request.message, "created_at": datetime.utcnow().isoformat()})
     context = analytics_for(seller)
-    response = _grounded_fallback(request, seller)
+    trace = []
+    response = "I am checking the seller signals now."
     source = "grounded-fallback"
-    fallback_approval = _fallback_approval(request, seller) if not (OpenAI and os.getenv("GROQ_API_KEY")) else None
-    if fallback_approval:
-        response = f"Approved. I will cut {seller['products'][0]['name']} to ₹899 for 7 days and restock 40 units. This is a mock marketplace action. I will check back in 3 days."
-        source = "grounded-fallback-approval"
-    elif not any(phrase in request.message.lower() for phrase in ("yes", "approve", "approved", "go ahead", "do it")):
-        _ensure_proposed(seller)
+    using_groq = bool(OpenAI and os.getenv("GROQ_API_KEY"))
+    if not using_groq:
+        if is_explicit_approval(request.message):
+            approval = _fallback_approval(request, seller)
+            if approval:
+                params = approval["params"]
+                response = f"Approved. I will set {params['new_price']} rupees for {params['days']} days and restock {params['restock_units']} units. This is a mock marketplace action. I will check back in 3 days."
+                source = "grounded-fallback-approval"
+                _record_trace(trace, "confirm_action", {"action_id": approval["id"]}, approval)
+            else:
+                response = "I do not have a pending action to approve yet. I will diagnose the drop first."
+        else:
+            response = _grounded_fallback(request, seller, trace)
     if OpenAI and os.getenv("GROQ_API_KEY"):
         client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url="https://api.groq.com/openai/v1", timeout=20, max_retries=2)
-        system = "You are Snapdeal Virtual KAM. Own the seller's problem from diagnosis to measured result. Use tools for every number; never invent figures. Separate observed facts from hypotheses. Check traffic, conversion, price, stock, ratings, and returns. Propose one concrete action, but never approve it yourself. Call confirm_action only when the latest seller message is an explicit yes, approve, or go ahead. Use concise spoken-style replies, no markdown, no emoji, and ask one question at a time."
+        system = "You are Snapdeal Virtual KAM. Own the seller's problem from diagnosis to simulated result. Use tools for every number; never invent figures. Separate observed facts from hypotheses. Check traffic, conversion, price, stock, ratings, and returns. Propose one concrete action, but never approve it yourself. Call confirm_action only when the latest seller message is an explicit approval. Use concise spoken-style replies, no markdown, no emoji, and ask one question at a time."
+        if request.language == "hi-IN":
+            system += " Reply in simple Hindi using Devanagari or Hinglish, with short spoken sentences."
         messages = [{"role": "system", "content": system}]
         persisted_history = request.history
         if not persisted_history:
@@ -288,47 +360,56 @@ def chat(request: ChatRequest):
                     break
                 for tool_call in assistant.tool_calls:
                     arguments = json.loads(tool_call.function.arguments or "{}")
-                    explicit_yes = any(phrase in request.message.lower() for phrase in ("yes", "approve", "approved", "go ahead", "do it"))
-                    result = {"error": "Seller approval is required"} if tool_call.function.name == "confirm_action" and not explicit_yes else _tool_result(tool_call.function.name, arguments, seller, request.seller_id)
+                    if tool_call.function.name == "confirm_action" and not is_explicit_approval(request.message):
+                        result = {"error": "Seller approval is required"}
+                        _record_trace(trace, tool_call.function.name, arguments, result)
+                    else:
+                        result = _tool_result(tool_call.function.name, arguments, seller, request.seller_id, trace)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": json.dumps(result)})
             source = "groq"
         except Exception:
             source = "deterministic-fallback-after-groq-error"
+            trace = []
+            response = _grounded_fallback(request, seller, trace)
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO conversations VALUES (:id,:seller_id,'assistant',:content,:created_at)"), {"id": str(uuid.uuid4()), "seller_id": request.seller_id, "content": response, "created_at": datetime.utcnow().isoformat()})
     with engine.begin() as conn:
         rows = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id ORDER BY created_at DESC"), {"seller_id": request.seller_id}).mappings().all()
     actions = [_action_row(row) for row in rows]
     proposed_action = next((action for action in actions if action["status"] == "proposed"), None)
-    if fallback_approval:
-        actions = [_action_row(row) for row in rows]
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO conversations VALUES (:id,:seller_id,'assistant',:content,:created_at)"), {"id": str(uuid.uuid4()), "seller_id": request.seller_id, "content": response, "created_at": datetime.utcnow().isoformat()})
-    return {"response": response, "source": source, "trace": _trace_for(seller), "proposed_action": proposed_action, "actions": actions}
+    return {"response": response, "source": source, "trace": trace, "proposed_action": proposed_action, "actions": actions}
 
 @app.post("/api/simulate/advance")
 def advance_simulation(request: AdvanceRequest):
     seller = get_seller(request.seller_id)
     if not seller: raise HTTPException(404, "Seller not found")
-    product = seller["products"][0]
-    before = {"orders": product["orders"], "conversion": product["conversion"], "price": product["price"], "inventory": product["inventory"]}
+    product = deepcopy(seller["products"][0])
+    before = {"orders": round(product["orders"] * request.days / 14), "conversion": product["conversion"], "price": product["price"], "inventory": product["inventory"]}
     with engine.begin() as conn:
-        rows = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id AND status = 'executed' ORDER BY executed_at DESC"), {"seller_id": request.seller_id}).mappings().all()
-    assumptions = ["assumed price elasticity: 1.4", "restock removes the stock-out constraint"]
-    for row in rows:
+        rows = conn.execute(text("SELECT * FROM actions WHERE seller_id = :seller_id AND status = 'executed' ORDER BY executed_at ASC"), {"seller_id": request.seller_id}).mappings().all()
+        stored = next((json.loads(row["measured_impact"]) for row in reversed(rows) if row["measured_impact"]), None)
+    if stored:
+        return stored
+    assumptions = ["conversion and orders use the shared capped price-elasticity model", "restock affects availability only when baseline cover is below the simulated period", "all values are a simulated 3-day outcome, not a guarantee"]
+    applicable = [row for row in rows if json.loads(row["params"]).get("product_id") == product["id"]]
+    for row in applicable:
         params = json.loads(row["params"])
-        if params.get("product_id") != product["id"]: continue
-        if params.get("new_price"): product["price"] = float(params["new_price"])
-        if params.get("restock_units"): product["inventory"] += int(params["restock_units"])
-        product["conversion"] = round(product["conversion"] * 1.4, 2)
-        product["orders"] = round(product["orders"] * 1.18)
+        projection = simulate_price_change(product, float(params.get("new_price", product["price"])), request.days)
+        available = product["inventory"] + int(params.get("restock_units", 0))
+        required = product["velocity"] * request.days
+        availability_factor = min(1.0, available / required) if required else 1.0
+        product["price"] = float(params.get("new_price", product["price"]))
+        product["conversion"] = projection["projected_conversion"]
+        product["orders"] = round(projection["projected_orders"] * availability_factor)
+        product["inventory"] = available
     product["inventory"] = max(0, product["inventory"] - round(product["velocity"] * request.days))
     after = {"orders": product["orders"], "conversion": product["conversion"], "price": product["price"], "inventory": product["inventory"]}
     measured = {"orders_change_percent": round((after["orders"] - before["orders"]) / before["orders"] * 100, 1), "conversion_before": before["conversion"], "conversion_after": after["conversion"]}
+    result = {"seller_id": request.seller_id, "days": request.days, "before": before, "after": after, "measured_impact": measured, "assumptions": assumptions, "callback": f"Simulated 3-day outcome: orders changed {measured['orders_change_percent']}%. Conversion moved from {before['conversion']}% to {after['conversion']}%. Should I extend the price cut and reorder?"}
     with engine.begin() as conn:
-        for row in rows:
-            conn.execute(text("UPDATE actions SET measured_impact = :measured WHERE id = :id"), {"id": row["id"], "measured": json.dumps(measured)})
-    return {"seller_id": request.seller_id, "days": request.days, "before": before, "after": after, "measured_impact": measured, "assumptions": assumptions, "callback": f"Orders are up {measured['orders_change_percent']}%. Conversion moved from {before['conversion']}% to {after['conversion']}%. Should I extend the price cut and reorder?"}
+        for row in applicable:
+            conn.execute(text("UPDATE actions SET measured_impact = :measured, applied_at = :applied_at WHERE id = :id AND measured_impact IS NULL"), {"id": row["id"], "measured": json.dumps(result), "applied_at": datetime.utcnow().isoformat()})
+    return result
 
 @app.post("/api/voice/transcribe")
 async def transcribe(file: UploadFile = File(...)):
@@ -345,12 +426,15 @@ async def transcribe(file: UploadFile = File(...)):
                 "https://api.sarvam.ai/speech-to-text",
                 headers={"api-subscription-key": api_key},
                 files={"file": (file.filename or "recording.webm", contents, file.content_type)},
-                data={"model": os.getenv("SARVAM_STT_MODEL", "saaras:v2"), "language_code": os.getenv("SARVAM_LANGUAGE", "en-IN")},
+                data={"model": os.getenv("SARVAM_STT_MODEL", "saarika:v2.5"), "language_code": os.getenv("SARVAM_LANGUAGE", "en-IN")},
             )
-        response.raise_for_status()
+        if response.is_error:
+            logger.error("Sarvam STT failed: status=%s body=%s", response.status_code, response.text)
+            return {"text": "", "source": "fallback", "message": f"Sarvam STT failed ({response.status_code}): {response.text[:500]}"}
         return {"text": response.json().get("transcript", "").strip(), "source": "sarvam"}
     except Exception as error:
-        return {"text": "", "source": "fallback", "message": f"Sarvam transcription is unavailable: {error.__class__.__name__}."}
+        logger.exception("Sarvam STT request failed")
+        return {"text": "", "source": "fallback", "message": f"Sarvam transcription is unavailable: {error}"}
 
 @app.post("/api/voice/synthesize")
 async def synthesize(payload: dict):
@@ -370,16 +454,19 @@ async def synthesize(payload: dict):
                 json={
                     "inputs": [speech_text],
                     "target_language_code": payload.get("language", os.getenv("SARVAM_LANGUAGE", "en-IN")),
-                    "speaker": os.getenv("SARVAM_TTS_SPEAKER", "meera"),
+                    "speaker": os.getenv("SARVAM_TTS_SPEAKER", "anushka"),
                     "model": os.getenv("SARVAM_TTS_MODEL", "bulbul:v2"),
                     "pace": 1.0,
                     "speech_sample_rate": 22050,
                     "enable_preprocessing": True,
                 },
             )
-        response.raise_for_status()
+        if response.is_error:
+            logger.error("Sarvam TTS failed: status=%s body=%s", response.status_code, response.text)
+            return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": f"Sarvam TTS failed ({response.status_code}): {response.text[:500]}"}
         audio = response.json().get("audios", [None])[0]
         return {"audio_base64": audio, "audio_format": "wav", "speech_text": speech_text, "source": "sarvam"}
     except Exception as error:
-        return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": f"Sarvam speech synthesis is unavailable: {error.__class__.__name__}."}
+        logger.exception("Sarvam TTS request failed")
+        return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": f"Sarvam speech synthesis is unavailable: {error}"}
 

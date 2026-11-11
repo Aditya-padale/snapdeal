@@ -1,62 +1,83 @@
 # Snapdeal Virtual KAM
 
-A voice-first seller growth manager MVP for the Snapdeal AI First internship assignment. This is a polished internal demo using clearly synthetic seller data. It diagnoses business changes with deterministic Python analytics, lets a seller model pricing decisions, and records explicitly approved simulated actions.
+A voice-first Mini AI Virtual KAM for a synthetic seller whose sales dropped. The KAM investigates evidence, proposes one concrete action, waits for explicit seller approval, records a mock execution, and reports a labelled simulated outcome.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  UI[React + Vite dashboard] -->|REST| API[FastAPI serverless function]
-  API --> Analytics[Python analytics + Growth Radar]
-  API --> DB[(SQLite Growth Memory)]
-  API --> LLM[Groq tool-calling loop]
-  UI -->|MediaRecorder| API
-  API --> Sarvam[Sarvam AI STT + TTS]
+  UI[React call UI] -->|/api/chat + history| Agent[FastAPI agent loop]
+  Agent --> Tools[Deterministic analytics tools]
+  Tools --> Board[Evidence board]
+  Agent --> Ledger[Action ledger]
+  Ledger --> Simulation[Pure 3-day simulation]
+  UI -->|Sarvam STT or browser speech| Agent
+  Agent -->|Sarvam TTS or browser speech| UI
 ```
 
-The Python layer calculates metrics and projections. Groq can call `get_sales_trend`, `get_funnel`, `get_competitor_prices`, `get_inventory`, and `simulate_price_change`; the agent must use returned facts rather than invent numbers. Marketplace actions are mock operations and require an explicit seller approval record before execution.
+All seller, product, competitor, and performance data is synthetic. Marketplace actions are mock operations.
+
+## Demo script
+
+1. Start the app and accept the incoming call.
+2. Let the evidence board fill one card at a time from the actual tool results.
+3. The KAM proposes a competitor-aligned price and enough stock for 21 days of cover.
+4. Say or type `yes, do it`; the latest pending action becomes executed in the ledger.
+5. Click `Fast-forward 3 days`; the callback and result strip show a `Simulated 3-day outcome`.
+6. Click Replay to hear the latest spoken response again.
+
+The fallback path works without API keys and is the recommended 90-second review path.
 
 ## Run locally
 
-### Backend
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cd ..
-cp .env.example .env
-uvicorn backend.main:app --reload --port 8000
-```
-
-### Frontend
-
 ```bash
 npm install
+cp .env.example .env
 npm run dev
 ```
 
-Open http://localhost:5173. Select one of the three synthetic sellers from the selector. The default fashion scenario is designed to demonstrate a 28% decline, lower conversion, a competitor price gap, tight inventory, a price simulation, and an approval request.
+In another terminal:
 
-## Deploy to Vercel
+```bash
+python -m venv backend/.venv
+source backend/.venv/bin/activate
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload --port 8000
+```
 
-Import this repository into Vercel and keep the default build settings from `vercel.json`. Vercel serves the Vite build from `dist` and exposes the FastAPI app through `api/index.py`. The frontend uses the same-origin `/api` path in production; no frontend API URL is required.
+For a separate backend port, set `VITE_API_URL=http://localhost:8000/api` before starting Vite. The default production path is same-origin `/api`; `api/index.py` exports the FastAPI app for Vercel.
 
-Set `GROQ_API_KEY`, `SARVAM_API_KEY`, and any other values from `.env.example` in the Vercel project settings. Serverless filesystems are temporary, so the default conversation database is stored in `/tmp` and is not durable. Set `DATABASE_URL` to a hosted SQLAlchemy-compatible database if conversation history must persist. Voice recording is sent to Sarvam AI from the backend, and browser speech synthesis remains a fallback when the Sarvam key or service is unavailable.
+## Environment variables
 
-## Optional AI and voice setup
+- `GROQ_API_KEY`: optional Groq key. Without it, deterministic Python fallback mode is used.
+- `GROQ_MODEL`: defaults to `openai/gpt-oss-20b`.
+- `SARVAM_API_KEY`: optional Sarvam key for STT and TTS.
+- `SARVAM_LANGUAGE`: server fallback language, normally `en-IN`.
+- `SARVAM_STT_MODEL`: defaults to `saarika:v2.5`.
+- `SARVAM_TTS_MODEL`: defaults to `bulbul:v2`.
+- `SARVAM_TTS_SPEAKER`: defaults to the valid `anushka` speaker.
+- `DATABASE_URL`: optional SQLAlchemy URL. Local default is SQLite; Vercel's `/tmp` filesystem is not durable.
 
-Set `GROQ_API_KEY` and keep `GROQ_MODEL=openai/gpt-oss-20b` in `.env`. The core demo keeps a grounded fallback when Groq is unavailable; with a key, `/api/chat` runs a bounded OpenAI-compatible tool-calling loop.
+## AI models and voice technologies used
 
-For voice, create a Sarvam AI account and add the free-tier API key as `SARVAM_API_KEY`. The backend uses `saaras:v2` for speech-to-text and `bulbul:v2` with the configured Indian language and speaker for text-to-speech. Change `SARVAM_LANGUAGE` to `hi-IN` for Hindi, or use the language selector in the UI.
+- Groq OpenAI-compatible API with `openai/gpt-oss-20b` for reasoning and tool calling.
+- Sarvam `saarika:v2.5` for speech-to-text, preserving the UI language code.
+- Sarvam `bulbul:v2` for text-to-speech.
+- Browser Web Speech API as the free speech fallback.
+- Deterministic Python analytics for every numeric fact and simulation.
 
-## Notes and limitations
+## Design decisions
 
-- All seller, product, competitor and performance data is synthetic.
-- Simulations are directional estimates, not guarantees. They use transparent conversion and margin assumptions.
-- The fallback chat asks for the product or category first, then ranks traffic, conversion, price, stock, ratings, and returns from synthetic facts. Groq adds the same diagnosis through tool calls.
-- A seller can approve the proposed price and restock plan by voice or text; the approval is stored in the `approvals` table with status `approved`.
-- Vercel functions are request-based, so the former local WebSocket acknowledgement endpoint is not included in the deployed API.
-- Piper voice model licensing and faster-whisper model licensing should be reviewed before redistribution.
-# snapdeal
+- Analytics are deterministic and the LLM reasons only over returned tool results. This prevents spoken numbers from being invented by the model.
+- Actions require explicit seller approval and only the most recent pending action can execute.
+- Outcomes are pure projections from the base synthetic data plus executed actions and are labelled simulated, not measured.
+- Synthetic data, mock marketplace actions, and Vercel `/tmp` storage are known limitations. Use a hosted SQLAlchemy-compatible database when durable history is required.
+
+## Tests and build
+
+```bash
+python -m unittest discover -s backend/tests
+npm run build
+```
+
+With a Groq key, the same `/api/chat` request runs the bounded tool-calling loop. The fallback path remains available if Groq times out or is not configured.
