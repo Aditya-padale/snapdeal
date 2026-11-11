@@ -10,8 +10,8 @@ flowchart LR
   API --> Analytics[Python analytics + Growth Radar]
   API --> DB[(SQLite Growth Memory)]
   API --> LLM[Groq tool-calling loop]
-  UI --> Browser[Web Speech API]
-  API --> Local[Whisper + Piper local upgrade]
+  UI -->|MediaRecorder| API
+  API --> Sarvam[Sarvam AI STT + TTS]
 ```
 
 The Python layer calculates metrics and projections. Groq can call `get_sales_trend`, `get_funnel`, `get_competitor_prices`, `get_inventory`, and `simulate_price_change`; the agent must use returned facts rather than invent numbers. Marketplace actions are mock operations and require an explicit seller approval record before execution.
@@ -43,18 +43,13 @@ Open http://localhost:5173. Select one of the three synthetic sellers from the s
 
 Import this repository into Vercel and keep the default build settings from `vercel.json`. Vercel serves the Vite build from `dist` and exposes the FastAPI app through `api/index.py`. The frontend uses the same-origin `/api` path in production; no frontend API URL is required.
 
-Set `GROQ_API_KEY` and any other values from `.env.example` in the Vercel project settings. Serverless filesystems are temporary, so the default conversation database is stored in `/tmp` and is not durable. Set `DATABASE_URL` to a hosted SQLAlchemy-compatible database if conversation history must persist. Deployed voice uses the browser Web Speech API by default, so no speech model is required on Vercel. Local Whisper and Piper remain optional upgrades for browsers without Web Speech support.
+Set `GROQ_API_KEY`, `SARVAM_API_KEY`, and any other values from `.env.example` in the Vercel project settings. Serverless filesystems are temporary, so the default conversation database is stored in `/tmp` and is not durable. Set `DATABASE_URL` to a hosted SQLAlchemy-compatible database if conversation history must persist. Voice recording is sent to Sarvam AI from the backend, and browser speech synthesis remains a fallback when the Sarvam key or service is unavailable.
 
 ## Optional AI and voice setup
 
-Set `GROQ_API_KEY` and keep `GROQ_MODEL=openai/gpt-oss-20b` in `.env`. The core demo keeps a grounded fallback when Groq is unavailable; with a key, `/api/chat` runs a bounded OpenAI-compatible tool-calling loop. For local voice upgrades, install `faster-whisper`, download a `base` or `small` model, install Piper, and download the English voice model once:
+Set `GROQ_API_KEY` and keep `GROQ_MODEL=openai/gpt-oss-20b` in `.env`. The core demo keeps a grounded fallback when Groq is unavailable; with a key, `/api/chat` runs a bounded OpenAI-compatible tool-calling loop.
 
-```bash
-mkdir -p ~/.local/share/piper
-python -m piper.download_voices --download-dir ~/.local/share/piper en_US-lessac-medium
-```
-
-The backend looks for that model in `~/.local/share/piper` by default. Override the location with `PIPER_MODEL_DIR` or select another `.onnx` voice with `PIPER_VOICE`. Audio endpoints validate uploads and report when local models are not installed; no paid speech provider is used.
+For voice, create a Sarvam AI account and add the free-tier API key as `SARVAM_API_KEY`. The backend uses `saaras:v2` for speech-to-text and `bulbul:v2` with the configured Indian language and speaker for text-to-speech. Change `SARVAM_LANGUAGE` to `hi-IN` for Hindi, or use the language selector in the UI.
 
 ## Notes and limitations
 

@@ -1,13 +1,10 @@
 import os
 import json
-import subprocess
-import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -25,7 +22,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     database_path = Path("/tmp/virtual_kam.db") if os.getenv("VERCEL") else Path(__file__).parent / "virtual_kam.db"
     DATABASE_URL = f"sqlite:///{database_path}"
-whisper_model = None
 engine_options = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, **engine_options)
 with engine.begin() as conn:
@@ -65,7 +61,7 @@ class AdvanceRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "llm_configured": bool(os.getenv("GROQ_API_KEY")), "voice_mode": "browser-web-speech-with-local-upgrades"}
+    return {"status": "ok", "llm_configured": bool(os.getenv("GROQ_API_KEY")), "voice_mode": "sarvam" if os.getenv("SARVAM_API_KEY") else "browser-fallback"}
 
 @app.get("/api/sellers")
 def sellers():
@@ -337,30 +333,24 @@ def advance_simulation(request: AdvanceRequest):
 @app.post("/api/voice/transcribe")
 async def transcribe(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("audio/"): raise HTTPException(400, "Upload an audio file")
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        return {"text": "", "source": "fallback", "message": "SARVAM_API_KEY is not configured."}
     contents = await file.read()
     if len(contents) > 15 * 1024 * 1024: raise HTTPException(413, "Audio file is too large")
-    audio_suffix = "." + (file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "webm")
     try:
-        from faster_whisper import WhisperModel
-        global whisper_model
-        if whisper_model is None:
-            whisper_model = WhisperModel(
-                os.getenv("WHISPER_MODEL", "base"),
-                device="cpu",
-                compute_type="int8",
-                use_auth_token=os.getenv("HF_TOKEN") or None,
+        import httpx
+        async with httpx.AsyncClient(timeout=45) as client:
+            response = await client.post(
+                "https://api.sarvam.ai/speech-to-text",
+                headers={"api-subscription-key": api_key},
+                files={"file": (file.filename or "recording.webm", contents, file.content_type)},
+                data={"model": os.getenv("SARVAM_STT_MODEL", "saaras:v2"), "language_code": os.getenv("SARVAM_LANGUAGE", "en-IN")},
             )
-        with tempfile.NamedTemporaryFile(suffix=audio_suffix, delete=False) as audio_file:
-            audio_file.write(contents)
-            audio_path = audio_file.name
-        segments, _ = whisper_model.transcribe(audio_path, language="en", vad_filter=True)
-        text_value = " ".join(segment.text.strip() for segment in segments).strip()
-        return {"text": text_value, "source": "faster-whisper"}
+        response.raise_for_status()
+        return {"text": response.json().get("transcript", "").strip(), "source": "sarvam"}
     except Exception as error:
-        return {"text": "", "source": "fallback", "message": f"Local transcription is unavailable: {error.__class__.__name__}. Install faster-whisper and its model."}
-    finally:
-        if "audio_path" in locals():
-            Path(audio_path).unlink(missing_ok=True)
+        return {"text": "", "source": "fallback", "message": f"Sarvam transcription is unavailable: {error.__class__.__name__}."}
 
 @app.post("/api/voice/synthesize")
 async def synthesize(payload: dict):
@@ -368,23 +358,28 @@ async def synthesize(payload: dict):
     if not text_value: raise HTTPException(400, "Text is required")
     speech_text = clean_text_for_speech(text_value)
     if not speech_text: raise HTTPException(400, "Text has no speakable content")
-    output_path = Path(tempfile.gettempdir()) / f"virtual-kam-{uuid.uuid4()}.wav"
-    configured_voice = os.getenv("PIPER_VOICE", "en_US-lessac-medium")
-    voice_path = Path(configured_voice).expanduser()
-    if not voice_path.is_file():
-        model_dir = Path(os.getenv("PIPER_MODEL_DIR", Path.home() / ".local/share/piper")).expanduser()
-        voice_path = model_dir / f"{configured_voice.removesuffix('.onnx')}.onnx"
-    if not voice_path.is_file():
-        return {"audio_url": None, "speech_text": speech_text, "source": "fallback", "message": "Piper voice model is unavailable. Download the configured voice model first."}
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": "SARVAM_API_KEY is not configured."}
     try:
-        subprocess.run(["piper", "--model", str(voice_path), "--output_file", str(output_path)], input=speech_text, text=True, capture_output=True, check=True, timeout=30)
-        return {"audio_url": f"/api/voice/audio/{output_path.name}", "speech_text": speech_text, "source": "piper"}
-    except (OSError, subprocess.SubprocessError):
-        return {"audio_url": None, "speech_text": speech_text, "source": "fallback", "message": "Piper could not synthesize this response. Check the local voice installation."}
-
-@app.get("/api/voice/audio/{filename}")
-def voice_audio(filename: str):
-    audio_path = Path(tempfile.gettempdir()) / filename
-    if not audio_path.is_file() or audio_path.suffix != ".wav": raise HTTPException(404, "Audio not found")
-    return FileResponse(audio_path, media_type="audio/wav", filename=filename)
+        import httpx
+        async with httpx.AsyncClient(timeout=45) as client:
+            response = await client.post(
+                "https://api.sarvam.ai/text-to-speech",
+                headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+                json={
+                    "inputs": [speech_text],
+                    "target_language_code": payload.get("language", os.getenv("SARVAM_LANGUAGE", "en-IN")),
+                    "speaker": os.getenv("SARVAM_TTS_SPEAKER", "meera"),
+                    "model": os.getenv("SARVAM_TTS_MODEL", "bulbul:v2"),
+                    "pace": 1.0,
+                    "speech_sample_rate": 22050,
+                    "enable_preprocessing": True,
+                },
+            )
+        response.raise_for_status()
+        audio = response.json().get("audios", [None])[0]
+        return {"audio_base64": audio, "audio_format": "wav", "speech_text": speech_text, "source": "sarvam"}
+    except Exception as error:
+        return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": f"Sarvam speech synthesis is unavailable: {error.__class__.__name__}."}
 
