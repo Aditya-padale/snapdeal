@@ -32,8 +32,10 @@ function App() {
   const [simProductId, setSimProductId] = useState('')
   const [simPrice, setSimPrice] = useState('')
   const [simDays, setSimDays] = useState('7')
+type BrowserRecognition = { continuous: boolean; interimResults: boolean; lang: string; start: () => void; stop: () => void; onresult: ((event: any) => void) | null; onerror: ((event: any) => void) | null; onend: (() => void) | null }
   const audioChunks = useRef<Blob[]>([])
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const recognitionRef = useRef<BrowserRecognition | null>(null)
 
   const seller = data?.seller
   const topProduct = products[0]
@@ -46,15 +48,44 @@ function App() {
     }).catch(() => undefined)
   }, [sellerId])
 
+  const speakText = async (text: string) => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+      const utterance = new SpeechSynthesisUtterance(text)
+      utterance.onend = () => setStatus('IDLE')
+      window.speechSynthesis.speak(utterance)
+      return
+    }
+    const speech = await fetch(`${API}/voice/synthesize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(r => r.json())
+    if (speech.audio_url) {
+      audioRef.current?.pause()
+      const audio = new Audio(`${apiOrigin}${speech.audio_url}`)
+      audioRef.current = audio
+      audio.onended = () => setStatus('IDLE')
+      await audio.play().catch(() => setStatus('IDLE'))
+    } else setStatus('IDLE')
+  }
   const sendMessage = async (text = message) => {
     if (!text.trim() || isSending) return
     const history = transcript.map(turn => ({ role: turn.role === 'seller' ? 'user' : 'assistant', content: turn.text }))
     setIsSending(true); setStatus('THINKING'); setTranscript(old => [...old, { role: 'seller', text }]); setMessage('')
     try { const result = await fetch(`${API}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seller_id: sellerId, message: text, history }) }).then(r => r.json()); setTranscript(old => [...old, { role: 'ai', text: result.response }]); setStatus('SPEAKING'); const speech = await fetch(`${API}/voice/synthesize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: result.response }) }).then(r => r.json()); if (speech.audio_url) { audioRef.current?.pause(); const audio = new Audio(`${apiOrigin}${speech.audio_url}`); audioRef.current = audio; audio.onended = () => setStatus('IDLE'); await audio.play().catch(() => undefined) } else { window.setTimeout(() => setStatus('IDLE'), 3200) } } catch { setTranscript(old => [...old, { role: 'ai', text: 'I cannot reach the KAM service right now. You can still explore the seller analytics and simulator.' }]); setStatus('IDLE') } finally { setIsSending(false) }
+    try { const result = await fetch(`${API}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seller_id: sellerId, message: text, history }) }).then(r => r.json()); setTranscript(old => [...old, { role: 'ai', text: result.response }]); setStatus('SPEAKING'); await speakText(result.response) } catch { setTranscript(old => [...old, { role: 'ai', text: 'I cannot reach the KAM service right now. You can still explore the seller analytics and simulator.' }]); setStatus('IDLE') } finally { setIsSending(false) }
   }
   const startRecording = async () => {
     audioRef.current?.pause();
+    const speechWindow = window as Window & { SpeechRecognition?: new () => BrowserRecognition; webkitSpeechRecognition?: new () => BrowserRecognition }
+    const Recognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition
+    if (Recognition) {
+      const recognition = new Recognition()
+      recognition.continuous = false; recognition.interimResults = false; recognition.lang = 'en-IN'
+      recognition.onresult = event => { const spokenText = event.results?.[0]?.[0]?.transcript?.trim(); if (spokenText) sendMessage(spokenText) }
+      recognition.onerror = () => { setMessage('Browser voice could not hear that. Try again or use the text fallback.'); setStatus('IDLE') }
+      recognition.onend = () => { recognitionRef.current = null; if (status === 'LISTENING') setStatus('IDLE') }
+      recognitionRef.current = recognition; recognition.start(); setStatus('LISTENING'); setMessage(''); return
+    }
     if (!navigator.mediaDevices) { setMessage('Microphone access is not available in this browser.'); return }
+      const stopRecording = () => { if (recognitionRef.current) { recognitionRef.current.stop(); recognitionRef.current = null; setStatus('IDLE'); return } recording?.stop(); recording && setRecording(null) }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find(type => MediaRecorder.isTypeSupported(type)) || '';

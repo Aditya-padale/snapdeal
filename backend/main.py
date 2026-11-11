@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import tempfile
 import uuid
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
-from .analytics import analytics_for
+from .analytics import analytics_for, funnel_for, inventory_for, price_comparison_for, sales_trend_for, simulate_price_change
 from .data import SELLERS, get_seller
 from .speech import clean_text_for_speech
 
@@ -55,7 +56,7 @@ class ApprovalRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "llm_configured": bool(os.getenv("GROQ_API_KEY")), "voice_mode": "local-models-when-installed"}
+    return {"status": "ok", "llm_configured": bool(os.getenv("GROQ_API_KEY")), "voice_mode": "browser-web-speech-with-local-upgrades"}
 
 @app.get("/api/sellers")
 def sellers():
@@ -124,12 +125,7 @@ def simulate(seller_id: str, request: SimulationRequest):
     seller = get_seller(seller_id)
     product = next((item for item in seller["products"] if item["id"] == request.product_id), None) if seller else None
     if not seller or not product: raise HTTPException(404, "Seller or product not found")
-    price_change = (request.new_price - product["price"]) / product["price"]
-    elasticity = max(-0.4, min(0.4, -price_change * 1.5))
-    projected_orders = round(product["orders"] * (1 + elasticity) * request.days / 14)
-    projected_revenue = round(projected_orders * request.new_price)
-    projected_margin = round(product["margin"] + (product["price"] - request.new_price) / request.new_price * 100, 1)
-    return {"product_id": product["id"], "product": product["name"], "days": request.days, "current_price": product["price"], "new_price": request.new_price, "projected_orders": projected_orders, "projected_revenue": projected_revenue, "projected_margin": projected_margin, "assumption": "Orders respond directionally to price with a capped elasticity estimate."}
+    return simulate_price_change(product, request.new_price, request.days)
 
 @app.get("/api/sellers/{seller_id}/growth-memory")
 def growth_memory(seller_id: str):
@@ -138,6 +134,58 @@ def growth_memory(seller_id: str):
         rows = conn.execute(text("SELECT id, role, content, created_at FROM conversations WHERE seller_id = :seller_id ORDER BY created_at DESC LIMIT 20"), {"seller_id": seller_id}).mappings().all()
     return {"entries": [dict(row) for row in rows]}
 
+def _tool_definitions():
+    return [
+        {"type": "function", "function": {"name": "get_sales_trend", "description": "Get observed revenue and order trend for the seller or product.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": []}}},
+        {"type": "function", "function": {"name": "get_funnel", "description": "Get observed impressions, views, CTR, conversion, and returns to diagnose traffic versus conversion.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": []}}},
+        {"type": "function", "function": {"name": "get_competitor_prices", "description": "Get the seller price, competitor price, and price gap for products.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": []}}},
+        {"type": "function", "function": {"name": "get_inventory", "description": "Get observed stock, velocity, ratings, and returns to diagnose availability and quality.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": []}}},
+        {"type": "function", "function": {"name": "simulate_price_change", "description": "Project orders, revenue, conversion, and margin for a price change. This is directional, not a guarantee.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}, "new_price": {"type": "number"}, "days": {"type": "integer"}}, "required": ["product_id", "new_price"]}}},
+        {"type": "function", "function": {"name": "record_approval", "description": "Record an approved proposed action only when the seller explicitly says yes, approve, or go ahead.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}, "action": {"type": "string"}}, "required": ["product_id", "action"]}}},
+    ]
+
+
+def _tool_result(name: str, arguments: dict, seller: dict, seller_id: str):
+    product = next((item for item in seller["products"] if item["id"] == arguments.get("product_id")), seller["products"][0])
+    if name == "get_sales_trend": return sales_trend_for(seller, product)
+    if name == "get_funnel": return funnel_for(seller, product)
+    if name == "get_competitor_prices": return price_comparison_for(seller, product)
+    if name == "get_inventory": return inventory_for(seller, product)
+    if name == "simulate_price_change": return simulate_price_change(product, float(arguments["new_price"]), int(arguments.get("days", 7)))
+    if name == "record_approval":
+        approval = {"id": str(uuid.uuid4()), "seller_id": seller_id, "product_id": arguments["product_id"], "action": arguments["action"], "status": "approved", "created_at": datetime.utcnow().isoformat()}
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO approvals VALUES (:id,:seller_id,:product_id,:action,:status,:created_at)"), approval)
+        return approval
+    raise ValueError(f"Unknown tool: {name}")
+
+
+def _grounded_fallback(request: ChatRequest, seller: dict):
+    product = seller["products"][0]
+    message = request.message.lower()
+    if not request.history and not any(word in message for word in (product["name"].lower(), seller["category"].lower())):
+        return "Which product or category dropped? I will check traffic, conversion, price, stock, ratings, and returns in that order."
+    funnel = funnel_for(seller, product)
+    pricing = price_comparison_for(seller, product)
+    inventory = inventory_for(seller, product)
+    return (f"For {product['name']}, impressions are {funnel['impressions']} and conversion fell from "
+            f"{product['previous_conversion']}% to {product['conversion']}%. The price is {pricing['gap_percent']}% "
+            f"above the competitor and only {inventory['inventory']} units remain. Traffic looks stable, so I rank "
+            f"conversion and price ahead of stock. Should I propose {product['name']} at ₹899 for 7 days and restocking 40 units?")
+
+
+def _fallback_approval(request: ChatRequest, seller: dict):
+    previous_assistant = next((turn.get("content", "").lower() for turn in reversed(request.history) if turn.get("role") == "assistant"), "")
+    explicit_yes = any(phrase in request.message.lower() for phrase in ("yes", "approve", "approved", "go ahead", "do it"))
+    if not explicit_yes or "restocking 40 units" not in previous_assistant:
+        return None
+    product = seller["products"][0]
+    approval = {"id": str(uuid.uuid4()), "seller_id": request.seller_id, "product_id": product["id"], "action": f"Cut {product['name']} to ₹899 for 7 days and restock 40 units", "status": "approved", "created_at": datetime.utcnow().isoformat()}
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO approvals VALUES (:id,:seller_id,:product_id,:action,:status,:created_at)"), approval)
+    return approval
+
+
 @app.post("/api/chat")
 def chat(request: ChatRequest):
     seller = get_seller(request.seller_id)
@@ -145,27 +193,33 @@ def chat(request: ChatRequest):
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO conversations VALUES (:id,:seller_id,'user',:content,:created_at)"), {"id": str(uuid.uuid4()), "seller_id": request.seller_id, "content": request.message, "created_at": datetime.utcnow().isoformat()})
     context = analytics_for(seller)
-    response = f"I checked {seller['name']}'s recent numbers. The clearest signal is conversion: your top product moved from {seller['products'][0]['previous_conversion']}% to {seller['products'][0]['conversion']}%, while impressions remain healthy. I see this as a pricing hypothesis, not a proven cause. Would you like to test a ₹50 reduction on {seller['products'][0]['name']} for seven days?"
-    source = "deterministic-demo-context"
-    previous_assistant_message = next(
-        (turn["content"] for turn in reversed(request.history) if turn.get("role") == "assistant"),
-        "",
-    ).lower()
-    if "what area" in previous_assistant_message or "focus" in previous_assistant_message:
-        response = f"Got it. We will focus on {request.message.strip()} first. I will use the seller data to separate what changed from what might be causing it, then suggest one measurable next step."
-        source = "deterministic-contextual-follow-up"
+    response = _grounded_fallback(request, seller)
+    source = "grounded-fallback"
+    fallback_approval = _fallback_approval(request, seller) if not (OpenAI and os.getenv("GROQ_API_KEY")) else None
+    if fallback_approval:
+        response = f"Approved and recorded. I will cut {seller['products'][0]['name']} to ₹899 for 7 days, restock 40 units, and check back in 3 days."
+        source = "grounded-fallback-approval"
     if OpenAI and os.getenv("GROQ_API_KEY"):
         client = OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url="https://api.groq.com/openai/v1", timeout=20, max_retries=2)
-        system = "You are Snapdeal Virtual KAM. Be concise and conversational. Use only the supplied seller facts. Separate observed facts from hypotheses, never guarantee projections, and never approve an action yourself. Ask one question at a time."
+        system = "You are Snapdeal Virtual KAM. Diagnose one product or category at a time. Start by asking which product or category dropped if unclear. Check hypotheses in this order: traffic, conversion, price, stock, ratings, returns. You MUST use tools for numbers and cite their returned facts. Rank causes with evidence, separate facts from hypotheses, and never invent or guarantee numbers. Propose an action plan for seller approval. Call record_approval only after explicit approval in the current conversation. Be concise and ask one question at a time."
         messages = [{"role": "system", "content": system}]
         for turn in request.history[-20:]:
             if turn.get("role") in ("user", "assistant") and turn.get("content"):
                 messages.append({"role": turn["role"], "content": turn["content"]})
-        facts = {"seller": seller["name"], "analytics": context, "user_message": request.message}
-        messages.append({"role": "user", "content": str(facts)})
+        facts = {"seller": seller["name"], "category": seller["category"], "analytics_context": context, "user_message": request.message}
+        messages.append({"role": "user", "content": json.dumps(facts)})
         try:
-            completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), messages=messages, temperature=0.2)
-            response = completion.choices[0].message.content or response
+            for _ in range(4):
+                completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), messages=messages, tools=_tool_definitions(), tool_choice="auto", temperature=0.2)
+                assistant = completion.choices[0].message
+                messages.append(assistant.model_dump(exclude_none=True))
+                if not assistant.tool_calls:
+                    response = assistant.content or response
+                    break
+                for tool_call in assistant.tool_calls:
+                    arguments = json.loads(tool_call.function.arguments or "{}")
+                    result = _tool_result(tool_call.function.name, arguments, seller, request.seller_id)
+                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": json.dumps(result)})
             source = "groq"
         except Exception:
             source = "deterministic-fallback-after-groq-error"

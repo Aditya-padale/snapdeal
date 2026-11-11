@@ -9,12 +9,12 @@ flowchart LR
   UI[React + Vite dashboard] -->|REST| API[FastAPI serverless function]
   API --> Analytics[Python analytics + Growth Radar]
   API --> DB[(SQLite Growth Memory)]
-  API --> LLM[Groq openai/gpt-oss-20b]
-  API --> STT[faster-whisper local]
-  API --> TTS[Piper local]
+  API --> LLM[Groq tool-calling loop]
+  UI --> Browser[Web Speech API]
+  API --> Local[Whisper + Piper local upgrade]
 ```
 
-The Python layer calculates metrics and projections. The LLM is intended to interpret those structured results and hold the conversation; it must never invent numbers. Marketplace actions are mock operations and require an approval record before execution.
+The Python layer calculates metrics and projections. Groq can call `get_sales_trend`, `get_funnel`, `get_competitor_prices`, `get_inventory`, and `simulate_price_change`; the agent must use returned facts rather than invent numbers. Marketplace actions are mock operations and require an explicit seller approval record before execution.
 
 ## Run locally
 
@@ -43,11 +43,11 @@ Open http://localhost:5173. Select one of the three synthetic sellers from the s
 
 Import this repository into Vercel and keep the default build settings from `vercel.json`. Vercel serves the Vite build from `dist` and exposes the FastAPI app through `api/index.py`. The frontend uses the same-origin `/api` path in production; no frontend API URL is required.
 
-Set `GROQ_API_KEY` and any other values from `.env.example` in the Vercel project settings. Serverless filesystems are temporary, so the default conversation database is stored in `/tmp` and is not durable. Set `DATABASE_URL` to a hosted SQLAlchemy-compatible database if conversation history must persist. Local Whisper and Piper speech engines remain optional and are not installed by the root Vercel dependency file; the deployed voice endpoints return their existing fallback response unless those services are provided separately.
+Set `GROQ_API_KEY` and any other values from `.env.example` in the Vercel project settings. Serverless filesystems are temporary, so the default conversation database is stored in `/tmp` and is not durable. Set `DATABASE_URL` to a hosted SQLAlchemy-compatible database if conversation history must persist. Deployed voice uses the browser Web Speech API by default, so no speech model is required on Vercel. Local Whisper and Piper remain optional upgrades for browsers without Web Speech support.
 
 ## Optional AI and voice setup
 
-Set `GROQ_API_KEY` and keep `GROQ_MODEL=openai/gpt-oss-20b` in `.env`. The current MVP keeps the core demo deterministic when Groq is unavailable; the `/api/chat` boundary is the integration point for structured tool calling with the OpenAI-compatible Groq SDK. For local voice, install `faster-whisper`, download a `base` or `small` model, install Piper, and download the English voice model once:
+Set `GROQ_API_KEY` and keep `GROQ_MODEL=openai/gpt-oss-20b` in `.env`. The core demo keeps a grounded fallback when Groq is unavailable; with a key, `/api/chat` runs a bounded OpenAI-compatible tool-calling loop. For local voice upgrades, install `faster-whisper`, download a `base` or `small` model, install Piper, and download the English voice model once:
 
 ```bash
 mkdir -p ~/.local/share/piper
@@ -60,7 +60,8 @@ The backend looks for that model in `~/.local/share/piper` by default. Override 
 
 - All seller, product, competitor and performance data is synthetic.
 - Simulations are directional estimates, not guarantees. They use transparent conversion and margin assumptions.
-- The current demo chat uses a deterministic context response so the UI remains demonstrable without an API key. Replace that response inside `backend/main.py` with the Groq tool-calling loop when credentials are available.
+- The fallback chat asks for the product or category first, then ranks traffic, conversion, price, stock, ratings, and returns from synthetic facts. Groq adds the same diagnosis through tool calls.
+- A seller can approve the proposed price and restock plan by voice or text; the approval is stored in the `approvals` table with status `approved`.
 - Vercel functions are request-based, so the former local WebSocket acknowledgement endpoint is not included in the deployed API.
 - Piper voice model licensing and faster-whisper model licensing should be reviewed before redistribution.
 # snapdeal
