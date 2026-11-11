@@ -29,6 +29,7 @@ engine_options = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.
 engine = create_engine(DATABASE_URL, **engine_options)
 with engine.begin() as conn:
     conn.execute(text("CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, seller_id TEXT, role TEXT, content TEXT, created_at TEXT)"))
+    conn.execute(text("CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, seller_id TEXT, product_id TEXT, action TEXT, status TEXT, created_at TEXT)"))
 
 app = FastAPI(title="Snapdeal Virtual KAM", version="0.1.0")
 app.add_middleware(
@@ -42,6 +43,15 @@ class ChatRequest(BaseModel):
     seller_id: str
     message: str = Field(min_length=1, max_length=4000)
     history: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+
+class SimulationRequest(BaseModel):
+    product_id: str
+    new_price: float = Field(gt=0)
+    days: int = Field(default=7, ge=1, le=30)
+
+class ApprovalRequest(BaseModel):
+    product_id: str
+    action: str = Field(min_length=1, max_length=240)
 
 @app.get("/api/health")
 def health():
@@ -64,6 +74,69 @@ def products(seller_id: str):
     seller = get_seller(seller_id)
     if not seller: raise HTTPException(404, "Seller not found")
     return seller["products"]
+
+@app.get("/api/sellers/{seller_id}/conversations")
+def conversations(seller_id: str):
+    if not get_seller(seller_id): raise HTTPException(404, "Seller not found")
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT id, role, content, created_at FROM conversations WHERE seller_id = :seller_id ORDER BY created_at"), {"seller_id": seller_id}).mappings().all()
+    return [dict(row) for row in rows]
+
+@app.get("/api/sellers/{seller_id}/growth-radar")
+def growth_radar(seller_id: str):
+    seller = get_seller(seller_id)
+    if not seller: raise HTTPException(404, "Seller not found")
+    metrics = analytics_for(seller)
+    return {"signals": [
+        {"id": "revenue", "label": "Revenue momentum", "value": metrics["sales_change"], "unit": "%", "direction": "up" if metrics["sales_change"] >= 0 else "down", "priority": "high" if metrics["sales_change"] < -10 else "medium"},
+        {"id": "conversion", "label": "Conversion movement", "value": metrics["changes"]["conversion"], "unit": " pts", "direction": "up" if metrics["changes"]["conversion"] >= 0 else "down", "priority": "high" if metrics["changes"]["conversion"] < -1 else "low"},
+        {"id": "competition", "label": "Competitor price gap", "value": metrics["avg_competitor_gap"], "unit": "%", "direction": "up" if metrics["avg_competitor_gap"] > 0 else "down", "priority": "medium"},
+        {"id": "inventory", "label": "Inventory pressure", "value": seller["products"][0]["inventory"], "unit": " units", "direction": "down", "priority": "high" if seller["products"][0]["inventory"] < 20 else "low"},
+    ]}
+
+@app.get("/api/sellers/{seller_id}/approvals")
+def approvals(seller_id: str):
+    if not get_seller(seller_id): raise HTTPException(404, "Seller not found")
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT id, product_id, action, status, created_at FROM approvals WHERE seller_id = :seller_id ORDER BY created_at DESC"), {"seller_id": seller_id}).mappings().all()
+    return [dict(row) for row in rows]
+
+@app.post("/api/sellers/{seller_id}/approvals")
+def create_approval(seller_id: str, request: ApprovalRequest):
+    seller = get_seller(seller_id)
+    if not seller or not any(product["id"] == request.product_id for product in seller["products"]): raise HTTPException(404, "Seller or product not found")
+    approval = {"id": str(uuid.uuid4()), "seller_id": seller_id, "product_id": request.product_id, "action": request.action, "status": "pending", "created_at": datetime.utcnow().isoformat()}
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO approvals VALUES (:id,:seller_id,:product_id,:action,:status,:created_at)"), approval)
+    return approval
+
+@app.patch("/api/approvals/{approval_id}")
+def update_approval(approval_id: str, payload: dict):
+    status = payload.get("status")
+    if status not in ("approved", "rejected"): raise HTTPException(400, "Status must be approved or rejected")
+    with engine.begin() as conn:
+        result = conn.execute(text("UPDATE approvals SET status = :status WHERE id = :id"), {"id": approval_id, "status": status})
+    if result.rowcount == 0: raise HTTPException(404, "Approval not found")
+    return {"id": approval_id, "status": status}
+
+@app.post("/api/sellers/{seller_id}/simulate")
+def simulate(seller_id: str, request: SimulationRequest):
+    seller = get_seller(seller_id)
+    product = next((item for item in seller["products"] if item["id"] == request.product_id), None) if seller else None
+    if not seller or not product: raise HTTPException(404, "Seller or product not found")
+    price_change = (request.new_price - product["price"]) / product["price"]
+    elasticity = max(-0.4, min(0.4, -price_change * 1.5))
+    projected_orders = round(product["orders"] * (1 + elasticity) * request.days / 14)
+    projected_revenue = round(projected_orders * request.new_price)
+    projected_margin = round(product["margin"] + (product["price"] - request.new_price) / request.new_price * 100, 1)
+    return {"product_id": product["id"], "product": product["name"], "days": request.days, "current_price": product["price"], "new_price": request.new_price, "projected_orders": projected_orders, "projected_revenue": projected_revenue, "projected_margin": projected_margin, "assumption": "Orders respond directionally to price with a capped elasticity estimate."}
+
+@app.get("/api/sellers/{seller_id}/growth-memory")
+def growth_memory(seller_id: str):
+    if not get_seller(seller_id): raise HTTPException(404, "Seller not found")
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT id, role, content, created_at FROM conversations WHERE seller_id = :seller_id ORDER BY created_at DESC LIMIT 20"), {"seller_id": seller_id}).mappings().all()
+    return {"entries": [dict(row) for row in rows]}
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
