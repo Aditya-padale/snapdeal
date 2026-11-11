@@ -8,7 +8,7 @@ DB_FILE.close()
 os.environ['DATABASE_URL'] = f'sqlite:///{DB_FILE.name}'
 os.environ.pop('GROQ_API_KEY', None)
 
-from backend.main import AdvanceRequest, ChatRequest, advance_simulation, chat, engine, is_explicit_approval
+from backend.main import AdvanceRequest, ChatRequest, _seller_response, advance_simulation, chat, engine, is_explicit_approval
 from sqlalchemy import text
 
 
@@ -26,6 +26,10 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(is_explicit_approval('haan, kar do'))
         self.assertFalse(is_explicit_approval('I sold 5 kurtas yesterday'))
         self.assertFalse(is_explicit_approval("don't do it"))
+
+    def test_seller_response_hides_action_id(self):
+        response = _seller_response('Approved. Action ID: 02c32309-bff6-4c8d-846d-1b433aa5a891.')
+        self.assertEqual(response, 'Approved.')
 
     def test_trace_proposal_and_conversation_are_grounded(self):
         first = chat(ChatRequest(seller_id=self.seller_id, message='Please diagnose the sales drop.', history=[{'role': 'user', 'content': 'context'}]))

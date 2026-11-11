@@ -197,6 +197,10 @@ def is_explicit_approval(message: str) -> bool:
     return any(re.search(rf"\b{re.escape(phrase)}\b", normalized) for phrase in APPROVAL_PHRASES)
 
 
+def _seller_response(response: str) -> str:
+    return re.sub(r"\s*Action ID:\s*[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.?", "", response, flags=re.IGNORECASE).strip()
+
+
 def _trace_item(tool: str, arguments: dict, result: dict):
     product = result.get("product", "the product")
     if tool == "get_funnel":
@@ -371,6 +375,7 @@ def chat(request: ChatRequest):
             source = "deterministic-fallback-after-groq-error"
             trace = []
             response = _grounded_fallback(request, seller, trace)
+    response = _seller_response(response)
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO conversations VALUES (:id,:seller_id,'assistant',:content,:created_at)"), {"id": str(uuid.uuid4()), "seller_id": request.seller_id, "content": response, "created_at": datetime.utcnow().isoformat()})
     with engine.begin() as conn:
@@ -445,6 +450,8 @@ async def synthesize(payload: dict):
     api_key = os.getenv("SARVAM_API_KEY")
     if not api_key:
         return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": "SARVAM_API_KEY is not configured."}
+    if len(speech_text) > 500:
+        return {"audio_base64": None, "speech_text": speech_text, "source": "fallback", "message": "Sarvam TTS supports up to 500 characters per request."}
     try:
         import httpx
         async with httpx.AsyncClient(timeout=45) as client:

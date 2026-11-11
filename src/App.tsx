@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { Check, Mic, Phone, Play, RotateCcw, Sparkles, Square, Volume2, X } from 'lucide-react'
+import { Check, Mic, Phone, Play, RotateCcw, SkipForward, Sparkles, Square, Volume2, X } from 'lucide-react'
 
 type BrowserSpeechRecognition = { continuous: boolean; interimResults: boolean; lang: string; onresult: ((event: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }> }) => void) | null; onerror: ((event: { error: string }) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }
 type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition
@@ -34,6 +34,7 @@ function App() {
   const recorder = useRef<MediaRecorder | null>(null)
   const recognition = useRef<BrowserSpeechRecognition | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const speechRequest = useRef<AbortController | null>(null)
 
   useEffect(() => {
     fetch(`${API}/sellers/${seller.id}/radar`).then(response => response.json()).then(setRadar)
@@ -46,7 +47,12 @@ function App() {
     audioRef.current?.pause(); audioRef.current = null
     if ('speechSynthesis' in window) window.speechSynthesis.cancel()
     try {
-      const response = await fetch(`${API}/voice/synthesize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: value, language }) })
+      const controller = new AbortController()
+      speechRequest.current?.abort()
+      speechRequest.current = controller
+      const timeout = window.setTimeout(() => controller.abort(), 8000)
+      const response = await fetch(`${API}/voice/synthesize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: value, language }), signal: controller.signal })
+      window.clearTimeout(timeout)
       const result = await response.json()
       if (result.audio_base64) {
         const audio = new Audio(`data:audio/${result.audio_format || 'wav'};base64,${result.audio_base64}`)
@@ -60,7 +66,7 @@ function App() {
         await new Promise<void>(resolve => { utterance.onend = () => { setStatus('idle'); resolve() }; utterance.onerror = () => { setStatus('idle'); resolve() }; window.speechSynthesis.speak(utterance) })
         return
       }
-    } catch (error) { setAudioError(error instanceof Error ? error.message : 'Voice playback failed. Tap to hear the reply.') }
+    } catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) setAudioError(error instanceof Error ? error.message : 'Voice playback failed. Tap to hear the reply.') }
     setStatus('idle')
   }
 
@@ -103,13 +109,14 @@ function App() {
     } catch { setCaption('Microphone access was unavailable. Use the text fallback below.'); setStatus('idle') }
   }
 
-  const accept = async () => { setStage('call'); setTrace([]); if (radar) await speak(radar.opening_line); await send('Please diagnose the sales drop and propose the next action.') }
+  const accept = () => { setStage('call'); setTrace([]); setCaption(radar?.opening_line || 'I am checking your latest business signals now.'); void send('Please diagnose the sales drop and propose the next action.') }
   const advanceDays = async () => { try { const response = await fetch(`${API}/simulate/advance`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seller_id: seller.id, days: 3 }) }); if (!response.ok) throw new Error(`Simulation failed (${response.status})`); const result = await response.json(); setAdvance(result); setStage('callback'); await speak(result.callback) } catch (error) { setCaption(error instanceof Error ? error.message : 'Simulation failed. Try again.') } }
   const replay = () => { if (lastSpoken) void speak(lastSpoken) }
+  const skipVoice = () => { speechRequest.current?.abort(); speechRequest.current = null; audioRef.current?.pause(); audioRef.current = null; if ('speechSynthesis' in window) window.speechSynthesis.cancel(); setStatus('idle') }
 
   if (stage === 'incoming') return <main className="incoming"><div className="incoming-glow" /><div className="caller-mark"><Sparkles size={26} /></div><p className="eyebrow">INCOMING BUSINESS CALL · SYNTHETIC DEMO</p><h1>Snapdeal Virtual KAM<br /><span>is calling.</span></h1><p className="incoming-line">{radar?.opening_line || 'I am checking your latest business signals now.'}</p><div className="caller-name"><b>{seller.name}</b><span>{seller.category} · {seller.location}</span></div><div className="call-actions"><button className="decline" onClick={() => setStage('call')}><X size={20} /> Decline</button><button className="accept" onClick={() => void accept()}><Phone size={20} /> Accept call</button></div><small>All metrics are synthetic. Marketplace actions are mock operations.</small></main>
 
-  return <main className="workspace">
+  return <main className="workspace">{status === 'speaking' && <button className="replay skip-voice" onClick={skipVoice} title="Skip voice playback"><SkipForward size={15} /> Skip voice</button>}
     <header className="topbar"><div className="brand"><div className="brand-mark"><Sparkles size={17} /></div><b>virtual<span>KAM</span></b><small>seller ownership desk</small></div><div className="top-right"><span className="synthetic-dot" /> Synthetic seller data <select value={language} onChange={event => setLanguage(event.target.value)}><option value="en-IN">English · India</option><option value="hi-IN">Hindi · India</option></select></div></header>
     <section className="call-header"><div><p className="eyebrow">ACTIVE CASE · {seller.id}</p><h1>{stage === 'callback' ? 'The result is in.' : 'Let’s solve the drop.'}</h1><p>{stage === 'callback' ? 'Three days after the approved mock action.' : 'I am checking the evidence, then I will own the next action with you.'}</p></div><div className={`live-state ${status}`}><span /> {status === 'listening' ? 'Listening' : status === 'thinking' ? 'Analysing' : status === 'speaking' ? 'Speaking' : 'On the call'}</div></section>
     <section className="trend-panel panel"><div className="panel-title"><div><p className="eyebrow">14-DAY REVENUE TREND</p><h2>{radar ? `Down ${radar.decline_percent.toFixed(1)}%` : 'Loading trend'}</h2></div><span>Observed synthetic revenue</span></div><div className="trend-chart"><ResponsiveContainer width="100%" height={170}><LineChart data={trend}><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dfe6dc" /><XAxis dataKey="day" hide /><YAxis hide /><Tooltip formatter={value => [`₹${String(value ?? '')}`, 'Revenue']} /><Line type="monotone" dataKey="revenue" stroke="#3d7658" strokeWidth={3} dot={false} /></LineChart></ResponsiveContainer>{advance && <span className="trend-overlay">After action: {advance.after.orders} simulated 3-day orders</span>}</div></section>
